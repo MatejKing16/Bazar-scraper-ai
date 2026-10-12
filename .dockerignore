@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env.local
+.git/
+.gitignore
+.dockerignore
+.vscode/
+.idea/
+data/
+*.tmp
