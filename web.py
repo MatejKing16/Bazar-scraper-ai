@@ -1,8 +1,8 @@
 """
 Webový dashboard a REST API pro Bazos Scraper & AI Evaluator.
-Umožňuje sledování stavu, konfiguraci (Co, Kolik, Kdy), spouštění kontrol,
-zobrazení TOP 3 nabídek za poslední měsíc a živé systémové logy.
-Navrženo pro lokální běh a přístup přes Tailscale nebo lokální síť.
+Umožňuje sledování stavu, správu vícero aktivních hledání (Multi-Target Search),
+konfiguraci plánovače, spouštění kontrol, zobrazení TOP 3 nabídek za poslední měsíc
+a živé systémové logy. Navrženo pro lokální běh a přístup přes Tailscale nebo lokální síť.
 """
 
 import html
@@ -24,7 +24,6 @@ from config import config, update_env_file
 logger = logging.getLogger("BazosWeb")
 
 app = Flask(__name__)
-# Vypnutí hlučných výchozích request logů werkzeugu pro čistší konzoli
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
@@ -32,7 +31,6 @@ def get_server_ips() -> Dict[str, str]:
     """Zjistí Tailscale IP adresu a lokální LAN IP adresu serveru."""
     ips = {"tailscale": "", "lan": "127.0.0.1"}
 
-    # 1. Detekce Tailscale IP přes rozhraní tailscale0
     try:
         res = subprocess.run(
             ["ip", "-4", "addr", "show", "tailscale0"],
@@ -46,7 +44,6 @@ def get_server_ips() -> Dict[str, str]:
     except Exception:
         pass
 
-    # 2. Detekce lokální IP adresy v síti
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.5)
@@ -94,9 +91,24 @@ def get_seen_manager():
     if p and hasattr(p, "seen_manager"):
         return p.seen_manager
 
-    # Fallback pro standalone běh web.py
     from main import SeenAdsManager
     return SeenAdsManager(config.seen_ids_file)
+
+
+def get_targets_manager():
+    """Vrátí instanci TargetManager (buď z pipeline nebo lokální)."""
+    p = get_pipeline_instance()
+    if p and hasattr(p, "targets_manager"):
+        return p.targets_manager
+
+    from targets_manager import TargetManager
+    return TargetManager(
+        config.targets_file,
+        default_query=config.user_query,
+        default_min_price=config.min_price,
+        default_max_price=config.max_price,
+        default_score_threshold=config.score_threshold,
+    )
 
 
 # =====================================================================
@@ -105,14 +117,14 @@ def get_seen_manager():
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
-    """Vrátí aktuální provozní stav scraperu, plánovače a statistiky."""
+    """Vrátí provozní stav scraperu, aktivní cíle a statistiky."""
     p = get_pipeline_instance()
     seen_mgr = get_seen_manager()
+    tm = get_targets_manager()
 
     is_running = p.is_running if p else True
     is_scraping = p.is_scraping if p else False
 
-    # Příští naplánovaný běh
     next_run = None
     try:
         next_job = schedule.next_run()
@@ -121,18 +133,18 @@ def api_status():
     except Exception:
         pass
 
-    # Čas posledního běhu
     last_run = None
     if p and p.last_run_time:
         last_run = p.last_run_time.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Kontrola aktivních hodin
     is_active_window = True
     if p:
         is_active_window = p.is_within_active_hours()
 
     server_ips = get_server_ips()
     stats = seen_mgr.get_stats()
+    all_targets = tm.get_all_targets()
+    active_targets = tm.get_active_targets()
 
     return jsonify({
         "status": "online",
@@ -152,17 +164,146 @@ def api_status():
         "web_port": config.web_port,
         "check_interval_minutes": config.check_interval_minutes,
         "score_threshold": config.score_threshold,
+        "active_targets_count": len(active_targets),
+        "total_targets_count": len(all_targets),
+        "targets": [{"id": t["id"], "name": t.get("name", "Hledání"), "is_active": t.get("is_active", True)} for t in all_targets],
     })
 
 
+# --- SPRÁVA VYHLEDÁVACÍCH CÍLŮ (MULTI-TARGET) ---
+
+@app.route("/api/targets", methods=["GET"])
+def api_get_targets():
+    """Vrátí všechny vyhledávací cíle."""
+    tm = get_targets_manager()
+    targets = tm.get_all_targets()
+    return jsonify({"success": True, "targets": targets})
+
+
+@app.route("/api/targets", methods=["POST"])
+def api_add_target():
+    """Vytvoří nový vyhledávací profil."""
+    data = request.get_json() or {}
+    name = str(data.get("name", "")).strip()
+    query = str(data.get("query", "")).strip()
+
+    if not name:
+        return jsonify({"success": False, "error": "Název hledání nesmí být prázdný."}), 400
+    if not query:
+        return jsonify({"success": False, "error": "Zadání pro AI nesmí být prázdné."}), 400
+
+    min_price = None
+    if str(data.get("min_price", "")).strip().isdigit():
+        min_price = int(data["min_price"])
+
+    max_price = None
+    if str(data.get("max_price", "")).strip().isdigit():
+        max_price = int(data["max_price"])
+
+    score_threshold = None
+    if str(data.get("score_threshold", "")).strip().isdigit():
+        score_threshold = int(data["score_threshold"])
+
+    is_active = bool(data.get("is_active", True))
+
+    tm = get_targets_manager()
+    target = tm.add_target(
+        name=name,
+        query=query,
+        min_price=min_price,
+        max_price=max_price,
+        score_threshold=score_threshold,
+        is_active=is_active,
+    )
+
+    # Předgenerovat AI strategii
+    p = get_pipeline_instance()
+    if p and hasattr(p, "groq") and p.groq:
+        try:
+            strategy = p.groq.generate_search_strategy(query)
+            if min_price is not None:
+                strategy["min_price"] = min_price
+            if max_price is not None:
+                strategy["max_price"] = max_price
+            tm.update_strategy(target["id"], strategy)
+            target["strategy"] = strategy
+        except Exception as e:
+            logger.warning(f"Nelze ihned vygenerovat strategii pro cíl {name}: {e}")
+
+    return jsonify({"success": True, "target": target})
+
+
+@app.route("/api/targets/<target_id>", methods=["PUT"])
+def api_update_target(target_id):
+    """Aktualizuje existující vyhledávací profil."""
+    data = request.get_json() or {}
+    updates: Dict[str, Any] = {}
+
+    if "name" in data:
+        updates["name"] = data["name"]
+    if "query" in data:
+        updates["query"] = data["query"]
+    if "min_price" in data:
+        val = str(data["min_price"]).strip()
+        updates["min_price"] = int(val) if val.isdigit() else None
+    if "max_price" in data:
+        val = str(data["max_price"]).strip()
+        updates["max_price"] = int(val) if val.isdigit() else None
+    if "score_threshold" in data:
+        val = str(data["score_threshold"]).strip()
+        updates["score_threshold"] = int(val) if val.isdigit() else None
+    if "is_active" in data:
+        updates["is_active"] = bool(data["is_active"])
+
+    tm = get_targets_manager()
+    target = tm.update_target(target_id, updates)
+    if not target:
+        return jsonify({"success": False, "error": "Cíl nenalezen."}), 404
+
+    # Pokud bylo změněno zadání, znovu vygenerujeme strategii
+    p = get_pipeline_instance()
+    if p and hasattr(p, "groq") and p.groq and "query" in updates:
+        try:
+            strategy = p.groq.generate_search_strategy(target["query"])
+            if target.get("min_price") is not None:
+                strategy["min_price"] = target["min_price"]
+            if target.get("max_price") is not None:
+                strategy["max_price"] = target["max_price"]
+            tm.update_strategy(target_id, strategy)
+            target["strategy"] = strategy
+        except Exception as e:
+            logger.warning(f"Nelze aktualizovat strategii pro cíl {target_id}: {e}")
+
+    return jsonify({"success": True, "target": target})
+
+
+@app.route("/api/targets/<target_id>/toggle", methods=["POST"])
+def api_toggle_target(target_id):
+    """Přepne stav aktivní/pozastaveno pro vybrané hledání."""
+    tm = get_targets_manager()
+    target = tm.toggle_target(target_id)
+    if not target:
+        return jsonify({"success": False, "error": "Cíl nenalezen."}), 404
+    return jsonify({"success": True, "target": target})
+
+
+@app.route("/api/targets/<target_id>", methods=["DELETE"])
+def api_delete_target(target_id):
+    """Smaže vyhledávací profil."""
+    tm = get_targets_manager()
+    success = tm.delete_target(target_id)
+    if not success:
+        return jsonify({"success": False, "error": "Cíl nenalezen."}), 404
+    return jsonify({"success": True, "message": "Hledání bylo úspěšně smazáno."})
+
+
+# --- SYSTÉMOVÁ KONFIGURACE (PLÁNOVAČ, HODINY) ---
+
 @app.route("/api/config", methods=["GET"])
 def api_get_config():
-    """Vrátí aktuální konfiguraci scraperu pro formulář."""
+    """Vrátí globální konfiguraci plánovače."""
     is_24_7 = config.active_start_hour is None or config.active_end_hour is None
     return jsonify({
-        "user_query": config.user_query,
-        "min_price": config.min_price if config.min_price is not None else "",
-        "max_price": config.max_price if config.max_price is not None else "",
         "check_interval_minutes": config.check_interval_minutes,
         "score_threshold": config.score_threshold,
         "max_pages_to_scrape": config.max_pages_to_scrape,
@@ -178,27 +319,10 @@ def api_get_config():
 
 @app.route("/api/config", methods=["POST"])
 def api_update_config():
-    """Uloží změněnou konfiguraci do .env a okamžitě ji přenačte v pipeline."""
+    """Uloží globální konfiguraci do .env a přenačte ji."""
     data = request.get_json() or {}
-
     updates: Dict[str, Any] = {}
 
-    # 1. CO scrapovat
-    if "user_query" in data:
-        uq = str(data["user_query"]).strip()
-        if not uq:
-            return jsonify({"success": False, "error": "Zadání hledání (USER_QUERY) nesmí být prázdné."}), 400
-        updates["USER_QUERY"] = uq
-
-    if "min_price" in data:
-        val = str(data["min_price"]).strip()
-        updates["MIN_PRICE"] = int(val) if val.isdigit() else ""
-
-    if "max_price" in data:
-        val = str(data["max_price"]).strip()
-        updates["MAX_PRICE"] = int(val) if val.isdigit() else ""
-
-    # 2. KOLIK scrapovat
     if "check_interval_minutes" in data:
         try:
             interval = int(data["check_interval_minutes"])
@@ -224,7 +348,6 @@ def api_update_config():
         except ValueError:
             pass
 
-    # 3. KDY scrapovat
     is_24_7 = bool(data.get("is_24_7", False))
     if is_24_7:
         updates["ACTIVE_START_HOUR"] = ""
@@ -244,15 +367,12 @@ def api_update_config():
     if "run_on_startup" in data:
         updates["RUN_ON_STARTUP"] = bool(data["run_on_startup"])
 
-    # Atomický zápis do .env
     try:
         update_env_file(updates)
-        logger.info(f"Konfigurace úspěšně uložena do .env: {list(updates.keys())}")
     except Exception as e:
         logger.error(f"Chyba při ukládání .env: {e}")
         return jsonify({"success": False, "error": f"Ukládání selhalo: {e}"}), 500
 
-    # Přenačtení konfigurace v běžící pipeline
     p = get_pipeline_instance()
     if p:
         try:
@@ -260,29 +380,33 @@ def api_update_config():
         except Exception as e:
             logger.warning(f"Chyba při reload_config: {e}")
 
-    return jsonify({"success": True, "message": "Konfigurace byla úspěšně uložena a aktivována."})
+    return jsonify({"success": True, "message": "Nastavení plánovače bylo úspěšně uloženo."})
 
+
+# --- NABÍDKY & LOGY ---
 
 @app.route("/api/top_deals", methods=["GET"])
 def api_top_deals():
-    """Vrátí TOP N nabídek za posledních X dní (výchozí: TOP 3 za 30 dní)."""
+    """Vrátí TOP N nabídek za posledních X dní (volitelně filtrováno podle target_id)."""
     days = int(request.args.get("days", 30))
     limit = int(request.args.get("limit", 3))
+    target_id = request.args.get("target_id") or None
 
     seen_mgr = get_seen_manager()
-    deals = seen_mgr.get_top_deals(days=days, limit=limit)
-    return jsonify({"success": True, "deals": deals, "days": days, "limit": limit})
+    deals = seen_mgr.get_top_deals(days=days, limit=limit, target_id=target_id)
+    return jsonify({"success": True, "deals": deals, "days": days, "limit": limit, "target_id": target_id})
 
 
 @app.route("/api/all_deals", methods=["GET"])
 def api_all_deals():
-    """Vrátí všechny zpracované inzeráty s možností vyhledávání a filtru skóre."""
+    """Vrátí všechny zpracované inzeráty s filtrem skóre, hledáním a target_id."""
     min_score = int(request.args.get("min_score", 0))
     limit = int(request.args.get("limit", 60))
     search = request.args.get("search", "")
+    target_id = request.args.get("target_id") or None
 
     seen_mgr = get_seen_manager()
-    deals = seen_mgr.get_all_deals(min_score=min_score, limit=limit, search=search)
+    deals = seen_mgr.get_all_deals(min_score=min_score, limit=limit, search=search, target_id=target_id)
     return jsonify({"success": True, "deals": deals, "total": len(deals)})
 
 
@@ -323,7 +447,8 @@ def api_test_telegram():
 def api_send_top_telegram():
     """Odešle TOP 3 měsíční nabídky přímo na Telegram."""
     seen_mgr = get_seen_manager()
-    top_deals = seen_mgr.get_top_deals(days=30, limit=3)
+    target_id = request.args.get("target_id") or None
+    top_deals = seen_mgr.get_top_deals(days=30, limit=3, target_id=target_id)
 
     if not top_deals:
         return jsonify({"success": False, "error": "V databázi za poslední měsíc nejsou žádné nabídky."}), 404
@@ -365,7 +490,7 @@ def api_logs():
 
 
 # =====================================================================
-# HTML DASHBOARD ŠABLONA
+# HTML DASHBOARD ŠABLONA S MULTI-TARGET PODPOROU
 # =====================================================================
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -393,11 +518,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             --bronze: #d97706;
         }
 
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -407,10 +528,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             padding: 16px;
         }
 
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
+        .container { max-width: 1200px; margin: 0 auto; }
 
         /* HEADER */
         header {
@@ -426,11 +544,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             gap: 16px;
         }
 
-        .brand {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
+        .brand { display: flex; align-items: center; gap: 12px; }
 
         .brand-icon {
             font-size: 28px;
@@ -444,16 +558,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             border: 1px solid rgba(59, 130, 246, 0.3);
         }
 
-        .brand-text h1 {
-            font-size: 20px;
-            font-weight: 700;
-            letter-spacing: -0.02em;
-        }
-
-        .brand-text p {
-            font-size: 13px;
-            color: var(--text-muted);
-        }
+        .brand-text h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
+        .brand-text p { font-size: 13px; color: var(--text-muted); }
 
         .status-badge-container {
             display: flex;
@@ -473,31 +579,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             border: 1px solid transparent;
         }
 
-        .badge-online {
-            background-color: rgba(16, 185, 129, 0.15);
-            color: #34d399;
-            border-color: rgba(16, 185, 129, 0.3);
-        }
+        .badge-online { background-color: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+        .badge-scraping { background-color: rgba(59, 130, 246, 0.15); color: #60a5fa; border-color: rgba(59, 130, 246, 0.3); animation: pulse 1.5s infinite; }
+        .badge-sleeping { background-color: rgba(245, 158, 11, 0.15); color: #fbbf24; border-color: rgba(245, 158, 11, 0.3); }
 
-        .badge-scraping {
-            background-color: rgba(59, 130, 246, 0.15);
-            color: #60a5fa;
-            border-color: rgba(59, 130, 246, 0.3);
-            animation: pulse 1.5s infinite;
-        }
-
-        .badge-sleeping {
-            background-color: rgba(245, 158, 11, 0.15);
-            color: #fbbf24;
-            border-color: rgba(245, 158, 11, 0.3);
-        }
-
-        .pulse-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background-color: currentColor;
-        }
+        .pulse-dot { width: 8px; height: 8px; border-radius: 50%; background-color: currentColor; }
 
         @keyframes pulse {
             0%, 100% { opacity: 1; }
@@ -532,12 +618,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             color: #93c5fd;
         }
 
-        /* TOP 3 HERO SECTION */
+        /* SECTION TITLES */
         .section-title {
             display: flex;
             align-items: center;
             justify-content: space-between;
             margin-bottom: 16px;
+            flex-wrap: wrap;
+            gap: 10px;
         }
 
         .section-title h2 {
@@ -548,6 +636,119 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             gap: 8px;
         }
 
+        /* TARGETS (MULTI-SEARCH) GRID */
+        .targets-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+
+        .target-card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            transition: border-color 0.15s, transform 0.15s;
+        }
+
+        .target-card:hover { border-color: #4b5563; }
+        .target-card.paused { opacity: 0.6; filter: grayscale(30%); }
+
+        .target-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 10px;
+            gap: 10px;
+        }
+
+        .target-title {
+            font-size: 17px;
+            font-weight: 700;
+            color: #f9fafb;
+        }
+
+        .target-query-box {
+            background: rgba(31, 41, 55, 0.4);
+            border: 1px solid rgba(75, 85, 99, 0.4);
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 13px;
+            color: #d1d5db;
+            margin-bottom: 12px;
+            line-height: 1.4;
+            max-height: 80px;
+            overflow-y: auto;
+        }
+
+        .target-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 14px;
+            font-size: 12px;
+        }
+
+        .meta-pill {
+            background: #1f2937;
+            padding: 3px 8px;
+            border-radius: 6px;
+            border: 1px solid #374151;
+            color: #93c5fd;
+        }
+
+        .target-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 1px solid rgba(55, 65, 81, 0.6);
+            padding-top: 12px;
+            gap: 8px;
+        }
+
+        /* TOGGLE SWITCH */
+        .toggle-switch {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            user-select: none;
+            gap: 8px;
+        }
+
+        .switch-input { display: none; }
+
+        .switch-slider {
+            width: 38px;
+            height: 20px;
+            background-color: #4b5563;
+            border-radius: 20px;
+            position: relative;
+            transition: background-color 0.2s;
+        }
+
+        .switch-slider::before {
+            content: "";
+            position: absolute;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background-color: #ffffff;
+            top: 3px;
+            left: 3px;
+            transition: transform 0.2s;
+        }
+
+        .switch-input:checked + .switch-slider { background-color: var(--accent-success); }
+        .switch-input:checked + .switch-slider::before { transform: translateX(18px); }
+
+        /* TOP 3 HERO SECTION */
         .top-deals-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -567,10 +768,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             transition: transform 0.2s, border-color 0.2s;
         }
 
-        .deal-card:hover {
-            border-color: #4b5563;
-            transform: translateY(-2px);
-        }
+        .deal-card:hover { border-color: #4b5563; transform: translateY(-2px); }
 
         .deal-card.rank-1 {
             border-top: 4px solid var(--gold);
@@ -619,6 +817,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             border-radius: 6px;
         }
 
+        .target-tag {
+            display: inline-block;
+            font-size: 11px;
+            font-weight: 600;
+            color: #a78bfa;
+            background: rgba(139, 92, 246, 0.15);
+            border: 1px solid rgba(139, 92, 246, 0.3);
+            padding: 2px 8px;
+            border-radius: 4px;
+            margin-bottom: 6px;
+        }
+
         .card-title {
             font-size: 16px;
             font-weight: 600;
@@ -626,22 +836,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             margin-bottom: 8px;
         }
 
-        .card-title a {
-            color: var(--text-main);
-            text-decoration: none;
-        }
+        .card-title a { color: var(--text-main); text-decoration: none; }
+        .card-title a:hover { color: var(--accent-primary); text-decoration: underline; }
 
-        .card-title a:hover {
-            color: var(--accent-primary);
-            text-decoration: underline;
-        }
-
-        .card-price {
-            font-size: 22px;
-            font-weight: 800;
-            color: #38bdf8;
-            margin-bottom: 12px;
-        }
+        .card-price { font-size: 22px; font-weight: 800; color: #38bdf8; margin-bottom: 12px; }
 
         .card-meta {
             font-size: 12px;
@@ -662,10 +860,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             border-left: 3px solid var(--accent-primary);
         }
 
-        .card-actions {
-            display: flex;
-            gap: 8px;
-        }
+        .card-actions { display: flex; gap: 8px; }
 
         /* BUTTONS */
         .btn {
@@ -683,79 +878,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             text-decoration: none;
         }
 
-        .btn:active {
-            transform: scale(0.98);
-        }
+        .btn:active { transform: scale(0.98); }
+        .btn-primary { background-color: var(--accent-primary); color: #ffffff; }
+        .btn-primary:hover { background-color: var(--accent-primary-hover); }
+        .btn-success { background-color: #059669; color: #ffffff; }
+        .btn-success:hover { background-color: #10b981; }
+        .btn-secondary { background-color: #374151; color: #f3f4f6; border-color: #4b5563; }
+        .btn-secondary:hover { background-color: #4b5563; }
+        .btn-danger { background-color: #dc2626; color: #ffffff; }
+        .btn-danger:hover { background-color: #ef4444; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
 
-        .btn-primary {
-            background-color: var(--accent-primary);
-            color: #ffffff;
-        }
-
-        .btn-primary:hover {
-            background-color: var(--accent-primary-hover);
-        }
-
-        .btn-success {
-            background-color: #059669;
-            color: #ffffff;
-        }
-
-        .btn-success:hover {
-            background-color: #10b981;
-        }
-
-        .btn-secondary {
-            background-color: #374151;
-            color: #f3f4f6;
-            border-color: #4b5563;
-        }
-
-        .btn-secondary:hover {
-            background-color: #4b5563;
-        }
-
-        .btn-sm {
-            padding: 6px 12px;
-            font-size: 12px;
-        }
-
-        /* SETTINGS FORM - CO / KOLIK / KDY */
-        .settings-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-            gap: 20px;
-            margin-bottom: 24px;
-        }
-
+        /* SETTINGS FORM & MODAL */
         .settings-card {
             background-color: var(--bg-card);
             border: 1px solid var(--border-color);
             border-radius: 12px;
             padding: 20px;
+            margin-bottom: 24px;
         }
 
-        .settings-card-header {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 16px;
-            border-bottom: 1px solid var(--border-color);
-            padding-bottom: 10px;
-        }
-
-        .settings-card-header h3 {
-            font-size: 16px;
-            font-weight: 700;
-        }
-
-        .form-group {
-            margin-bottom: 14px;
-        }
-
-        .form-group:last-child {
-            margin-bottom: 0;
-        }
+        .form-group { margin-bottom: 14px; }
+        .form-group:last-child { margin-bottom: 0; }
 
         label {
             display: block;
@@ -765,11 +909,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             margin-bottom: 6px;
         }
 
-        .help-text {
-            font-size: 12px;
-            color: var(--text-muted);
-            margin-top: 4px;
-        }
+        .help-text { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
 
         input[type="text"],
         input[type="number"],
@@ -795,16 +935,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
         }
 
-        textarea {
-            resize: vertical;
-            min-height: 105px;
-        }
+        textarea { resize: vertical; min-height: 90px; }
 
-        .row-2 {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 12px;
-        }
+        .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
 
         .checkbox-label {
             display: flex;
@@ -822,20 +956,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             cursor: pointer;
         }
 
-        .action-bar {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            margin-bottom: 30px;
-            background-color: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 16px 20px;
+        /* MODAL DIALOG */
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.75);
+            display: none;
             align-items: center;
-            justify-content: space-between;
+            justify-content: center;
+            z-index: 1000;
+            padding: 16px;
         }
 
-        /* TABS & ACTIVITY */
+        .modal {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            max-width: 580px;
+            width: 100%;
+            padding: 24px;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+            animation: fadeIn 0.15s ease-out;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 18px;
+        }
+
+        .modal-header h3 { font-size: 18px; font-weight: 700; }
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0 4px;
+        }
+        .modal-close:hover { color: var(--text-main); }
+
+        /* TABS */
         .tabs {
             display: flex;
             gap: 8px;
@@ -855,24 +1017,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             transition: color 0.15s, border-color 0.15s;
         }
 
-        .tab-btn:hover {
-            color: var(--text-main);
-        }
+        .tab-btn:hover { color: var(--text-main); }
+        .tab-btn.active { color: var(--accent-primary); border-bottom-color: var(--accent-primary); }
 
-        .tab-btn.active {
-            color: var(--accent-primary);
-            border-bottom-color: var(--accent-primary);
-        }
+        .tab-pane { display: none; }
+        .tab-pane.active { display: block; }
 
-        .tab-pane {
-            display: none;
-        }
-
-        .tab-pane.active {
-            display: block;
-        }
-
-        /* LOG CONSOLE */
+        /* TERMINAL LOGS */
         .terminal-window {
             background-color: #030712;
             border: 1px solid var(--border-color);
@@ -899,7 +1050,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .log-level-WARNING { color: #fbbf24; font-weight: 600; flex-shrink: 0; }
         .log-level-ERROR { color: #f87171; font-weight: 700; flex-shrink: 0; }
 
-        /* ALL DEALS TABLE */
+        /* TABLE */
         .table-container {
             background-color: var(--bg-card);
             border: 1px solid var(--border-color);
@@ -907,39 +1058,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             overflow-x: auto;
         }
 
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 13px;
-            text-align: left;
-        }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+        th { background-color: #1f2937; padding: 12px 16px; font-weight: 600; color: #d1d5db; border-bottom: 1px solid var(--border-color); }
+        td { padding: 12px 16px; border-bottom: 1px solid var(--border-color); }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background-color: var(--bg-card-hover); }
 
-        th {
-            background-color: #1f2937;
-            padding: 12px 16px;
-            font-weight: 600;
-            color: #d1d5db;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        td {
-            padding: 12px 16px;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        tr:last-child td {
-            border-bottom: none;
-        }
-
-        tr:hover td {
-            background-color: var(--bg-card-hover);
-        }
-
-        /* TOAST NOTIFICATION */
         #toast {
             position: fixed;
-            bottom: 24px;
-            right: 24px;
+            bottom: 24px; right: 24px;
             background-color: #1f2937;
             color: #ffffff;
             border: 1px solid #374151;
@@ -949,7 +1076,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             font-size: 14px;
             font-weight: 500;
             display: none;
-            z-index: 1000;
+            z-index: 2000;
             animation: fadeIn 0.2s ease-out;
         }
 
@@ -967,7 +1094,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="brand-icon">🤖</div>
                 <div class="brand-text">
                     <h1>Bazoš Scraper & AI Evaluator</h1>
-                    <p>Inteligentní vyhodnocování výhodných nabídek v reálném čase</p>
+                    <p>Sledování více aktivních hledání naraz s AI hodnocením</p>
                 </div>
             </div>
             <div class="status-badge-container">
@@ -984,10 +1111,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- NETWORK INFO BAR -->
         <div class="info-bar">
             <div>
-                <strong>Tailscale přístup:</strong>
+                <strong>Tailscale:</strong>
                 <span class="ip-chip" id="tailscaleIpChip">http://...</span>
                 <span style="margin: 0 8px; color: #4b5563;">|</span>
-                <strong>Lokální síť:</strong>
+                <strong>LAN:</strong>
                 <span class="ip-chip" id="lanIpChip">http://...</span>
             </div>
             <div>
@@ -995,13 +1122,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- SECTION: MOJE AKTIVNÍ HLEDÁNÍ (MULTI-SEARCH) -->
+        <div class="section-title">
+            <h2>🎯 Sledovaná hledání (Aktivní kategorie)</h2>
+            <div style="display: flex; gap: 8px;">
+                <button class="btn btn-primary btn-sm" onclick="openAddTargetModal()">
+                    ➕ Přidat nové hledání
+                </button>
+            </div>
+        </div>
+
+        <div class="targets-grid" id="targetsContainer">
+            <div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted); background: var(--bg-card); border-radius: 12px; border: 1px solid var(--border-color);">
+                Načítám sledovaná hledání...
+            </div>
+        </div>
+
         <!-- HERO SECTION: TOP 3 ZA POSLEDNÍ MĚSÍC -->
         <div class="section-title">
             <h2>🏆 TOP 3 nejlepší nabídky za poslední měsíc</h2>
-            <div style="display: flex; gap: 8px;">
-                <button class="btn btn-secondary btn-sm" onclick="loadTopDeals()">
-                    🔄 Obnovit
-                </button>
+            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <select id="topDealsTargetFilter" onchange="loadTopDeals()" style="max-width: 220px; padding: 6px 10px; font-size: 13px;">
+                    <option value="">Všechny kategorie</option>
+                </select>
+                <button class="btn btn-secondary btn-sm" onclick="loadTopDeals()">🔄 Obnovit</button>
                 <button class="btn btn-success btn-sm" onclick="sendTopDealsToTelegram()">
                     📲 Odeslat TOP 3 do Telegramu
                 </button>
@@ -1014,121 +1158,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- FORMULÁŘ NASTAVENÍ: CO, KOLIK, KDY -->
-        <div class="section-title">
-            <h2>⚙️ Nastavení scraperu (Co, Kolik, Kdy)</h2>
-            <span style="font-size: 13px; color: var(--text-muted);">Změny se ihned uloží a aplikují v běžícím procesu</span>
-        </div>
-
-        <form id="configForm" onsubmit="saveConfig(event)">
-            <div class="settings-grid">
-                <!-- 1. CO SCRAPOVAT -->
-                <div class="settings-card">
-                    <div class="settings-card-header">
-                        <span style="font-size: 20px;">🎯</span>
-                        <h3>1. Co scrapovat?</h3>
-                    </div>
-                    <div class="form-group">
-                        <label for="user_query">Zadání přirozeným jazykem (AI Prompt):</label>
-                        <textarea id="user_query" name="user_query" required placeholder="Např. Levná 3D tiskárna Creality nebo Prusa, plně funkční..."></textarea>
-                        <div class="help-text">Groq LLM si ze zadání sám odvodí klíčová a vylučovací slova.</div>
-                    </div>
-                    <div class="row-2">
-                        <div class="form-group">
-                            <label for="min_price">Minimální cena (Kč):</label>
-                            <input type="number" id="min_price" name="min_price" placeholder="např. 500">
-                        </div>
-                        <div class="form-group">
-                            <label for="max_price">Maximální cena (Kč):</label>
-                            <input type="number" id="max_price" name="max_price" placeholder="např. 4500">
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 2. KOLIK SCRAPOVAT -->
-                <div class="settings-card">
-                    <div class="settings-card-header">
-                        <span style="font-size: 20px;">📄</span>
-                        <h3>2. Kolik scrapovat?</h3>
-                    </div>
-                    <div class="form-group">
-                        <label for="max_pages_to_scrape">Počet stránek ke stažení na dotaz:</label>
-                        <select id="max_pages_to_scrape" name="max_pages_to_scrape">
-                            <option value="1">1 stránka (nejnovějších 20 inzerátů)</option>
-                            <option value="2">2 stránky (40 inzerátů)</option>
-                            <option value="3">3 stránky (60 inzerátů)</option>
-                            <option value="5">5 stránek (100 inzerátů)</option>
-                        </select>
-                        <div class="help-text">Doporučujeme 1–2 stránky pro rychlou a spolehlivou kontrolu.</div>
-                    </div>
-                    <div class="form-group">
-                        <label for="score_threshold">Minimální AI skóre pro Telegram notifikaci:</label>
-                        <select id="score_threshold" name="score_threshold">
-                            <option value="7">7 / 10 (Dobré nabídky)</option>
-                            <option value="8">8 / 10 (Skvělé nabídky – doporučeno)</option>
-                            <option value="9">9 / 10 (Výjimečné úlovky)</option>
-                            <option value="10">10 / 10 (Absolutní jackpot)</option>
-                        </select>
-                        <div class="help-text">Inzeráty s tímto a vyšším skóre obdržíte ihned do mobilu.</div>
-                    </div>
-                </div>
-
-                <!-- 3. KDY SCRAPOVAT -->
-                <div class="settings-card">
-                    <div class="settings-card-header">
-                        <span style="font-size: 20px;">⏰</span>
-                        <h3>3. Kdy scrapovat?</h3>
-                    </div>
-                    <div class="form-group">
-                        <label for="check_interval_minutes">Interval kontrol (minuty):</label>
-                        <input type="number" id="check_interval_minutes" name="check_interval_minutes" min="1" max="1440" required>
-                        <div class="help-text">Jak často automatický plánovač projde Bazoš (např. 30 minut).</div>
-                    </div>
-                    <div class="form-group">
-                        <label class="checkbox-label">
-                            <input type="checkbox" id="is_24_7" name="is_24_7" onchange="toggleHoursVisibility()">
-                            <strong>Běžet nepřetržitě 24/7</strong>
-                        </label>
-                    </div>
-                    <div class="row-2" id="hoursWindowRow">
-                        <div class="form-group">
-                            <label for="active_start_hour">Aktivní od (hodina):</label>
-                            <input type="number" id="active_start_hour" name="active_start_hour" min="0" max="23" value="8">
-                        </div>
-                        <div class="form-group">
-                            <label for="active_end_hour">Aktivní do (hodina):</label>
-                            <input type="number" id="active_end_hour" name="active_end_hour" min="0" max="23" value="20">
-                        </div>
-                    </div>
-                    <div class="form-group" style="margin-top: 10px;">
-                        <label class="checkbox-label">
-                            <input type="checkbox" id="run_on_startup" name="run_on_startup">
-                            <span>Vynutit okamžitý běh při startu aplikace</span>
-                        </label>
-                    </div>
-                </div>
-            </div>
-
-            <!-- ACTION BAR -->
-            <div class="action-bar">
-                <div style="display: flex; gap: 12px; align-items: center;">
-                    <button type="submit" class="btn btn-primary" id="btnSaveConfig">
-                        💾 Uložit nastavení
-                    </button>
-                    <button type="button" class="btn btn-secondary" onclick="testTelegram()">
-                        🔔 Otestovat Telegram spojení
-                    </button>
-                </div>
-                <div style="font-size: 13px; color: var(--text-muted);" id="statsSummary">
-                    Načítám statistiky...
-                </div>
-            </div>
-        </form>
-
-        <!-- TABS: HISTORIE & ŽIVÉ LOGY -->
+        <!-- TABS: NASTAVENÍ / HISTORIE / LOGY -->
         <div class="tabs">
             <button class="tab-btn active" onclick="switchTab('tab-deals', this)">
                 📋 Všechny nalezené inzeráty
+            </button>
+            <button class="tab-btn" onclick="switchTab('tab-settings', this)">
+                ⚙️ Globální plánovač & systém
             </button>
             <button class="tab-btn" onclick="switchTab('tab-logs', this)">
                 📟 Živá systémová konzole (Logy)
@@ -1138,8 +1174,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- TAB 1: SEZNAM INZERÁTŮ -->
         <div id="tab-deals" class="tab-pane active">
             <div style="display: flex; gap: 12px; margin-bottom: 14px; flex-wrap: wrap;">
-                <input type="text" id="dealSearchInput" placeholder="Hledat v názvu inzerátu..." style="max-width: 320px;" oninput="filterAllDeals()">
-                <select id="scoreFilterSelect" style="max-width: 200px;" onchange="filterAllDeals()">
+                <input type="text" id="dealSearchInput" placeholder="Hledat v názvu inzerátu..." style="max-width: 280px;" oninput="filterAllDeals()">
+                <select id="dealTargetFilterSelect" style="max-width: 220px;" onchange="filterAllDeals()">
+                    <option value="">Všechna hledání</option>
+                </select>
+                <select id="scoreFilterSelect" style="max-width: 180px;" onchange="filterAllDeals()">
                     <option value="0">Všechna skóre</option>
                     <option value="7">Skóre 7 a vyšší</option>
                     <option value="8">Pouze TOP nabídky (8+)</option>
@@ -1151,6 +1190,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <thead>
                         <tr>
                             <th>ID</th>
+                            <th>Kategorie</th>
                             <th>Název inzerátu</th>
                             <th>Cena</th>
                             <th>AI Skóre</th>
@@ -1160,19 +1200,87 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         </tr>
                     </thead>
                     <tbody id="allDealsTableBody">
-                        <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Načítám inzeráty...</td></tr>
+                        <tr><td colspan="8" style="text-align: center; color: var(--text-muted);">Načítám inzeráty...</td></tr>
                     </tbody>
                 </table>
             </div>
         </div>
 
-        <!-- TAB 2: TERMINÁL LOGŮ -->
+        <!-- TAB 2: GLOBÁLNÍ NASTAVENÍ -->
+        <div id="tab-settings" class="tab-pane">
+            <div class="settings-card">
+                <form id="globalConfigForm" onsubmit="saveGlobalConfig(event)">
+                    <h3 style="font-size: 16px; margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 8px;">
+                        ⏰ Nastavení plánovače kontrol
+                    </h3>
+                    <div class="row-3" style="margin-bottom: 16px;">
+                        <div class="form-group">
+                            <label for="check_interval_minutes">Interval kontrol (minuty):</label>
+                            <input type="number" id="check_interval_minutes" name="check_interval_minutes" min="1" max="1440" required>
+                            <div class="help-text">Jak často se spustí vyhledávací cyklus (např. 30 min).</div>
+                        </div>
+                        <div class="form-group">
+                            <label for="max_pages_to_scrape">Počet stránek na dotaz:</label>
+                            <select id="max_pages_to_scrape" name="max_pages_to_scrape">
+                                <option value="1">1 stránka (20 nejnovějších)</option>
+                                <option value="2">2 stránky (40 inzerátů)</option>
+                                <option value="3">3 stránky (60 inzerátů)</option>
+                            </select>
+                            <div class="help-text">Doporučujeme 1–2 stránky.</div>
+                        </div>
+                        <div class="form-group">
+                            <label for="score_threshold">Výchozí práh pro notifikace:</label>
+                            <select id="score_threshold" name="score_threshold">
+                                <option value="7">7 / 10</option>
+                                <option value="8">8 / 10 (Doporučeno)</option>
+                                <option value="9">9 / 10</option>
+                            </select>
+                            <div class="help-text">Pokud cíl nemá vlastní práh.</div>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="is_24_7" name="is_24_7" onchange="toggleHoursVisibility()">
+                            <strong>Běžet nepřetržitě 24/7</strong>
+                        </label>
+                    </div>
+
+                    <div class="row-2" id="hoursWindowRow" style="margin-bottom: 16px;">
+                        <div class="form-group">
+                            <label for="active_start_hour">Aktivní od (hodina 0–23):</label>
+                            <input type="number" id="active_start_hour" name="active_start_hour" min="0" max="23" value="8">
+                        </div>
+                        <div class="form-group">
+                            <label for="active_end_hour">Aktivní do (hodina 0–23):</label>
+                            <input type="number" id="active_end_hour" name="active_end_hour" min="0" max="23" value="20">
+                        </div>
+                    </div>
+
+                    <div class="form-group" style="margin-bottom: 20px;">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="run_on_startup" name="run_on_startup">
+                            <span>Vynutit okamžitý běh po startu aplikace</span>
+                        </label>
+                    </div>
+
+                    <div style="display: flex; gap: 12px; align-items: center;">
+                        <button type="submit" class="btn btn-primary" id="btnSaveConfig">
+                            💾 Uložit globální nastavení
+                        </button>
+                        <button type="button" class="btn btn-secondary" onclick="testTelegram()">
+                            🔔 Otestovat Telegram spojení
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- TAB 3: TERMINÁL LOGŮ -->
         <div id="tab-logs" class="tab-pane">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                 <span style="font-size: 13px; color: var(--text-muted);">Posledních 60 událostí ze systémového logu:</span>
-                <div style="display: flex; gap: 8px;">
-                    <button class="btn btn-secondary btn-sm" onclick="loadLogs()">🔄 Obnovit logy</button>
-                </div>
+                <button class="btn btn-secondary btn-sm" onclick="loadLogs()">🔄 Obnovit logy</button>
             </div>
             <div class="terminal-window" id="terminalLog">
                 Načítám logy...
@@ -1180,26 +1288,80 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- TOAST POPUP -->
+    <!-- MODAL: PŘIDAT / UPRAVIT HLEDÁNÍ -->
+    <div class="modal-overlay" id="targetModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="targetModalTitle">➕ Nové sledované hledání</h3>
+                <button class="modal-close" onclick="closeTargetModal()">&times;</button>
+            </div>
+            <form id="targetForm" onsubmit="saveTargetForm(event)">
+                <input type="hidden" id="modal_target_id" value="">
+                
+                <div class="form-group">
+                    <label for="modal_target_name">Název hledání / kategorie:</label>
+                    <input type="text" id="modal_target_name" required placeholder="např. Herní notebook RTX 3060 nebo 3D tiskárna">
+                    <div class="help-text">Slouží pro přehlednost v dashboardu a štítek v Telegram zprávách.</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="modal_target_query">Zadání přirozeným jazykem (AI Prompt):</label>
+                    <textarea id="modal_target_query" required placeholder="Popište co nejpřesněji, co chcete koupit, jaké modely, značky, výbavu a jaká rizika/vady vyřadit..."></textarea>
+                    <div class="help-text">Groq LLM automaticky odvodí vyhledávací fráze a vylučovací slova.</div>
+                </div>
+
+                <div class="row-2">
+                    <div class="form-group">
+                        <label for="modal_target_min_price">Minimální cena (Kč):</label>
+                        <input type="number" id="modal_target_min_price" placeholder="např. 500">
+                    </div>
+                    <div class="form-group">
+                        <label for="modal_target_max_price">Maximální cena (Kč):</label>
+                        <input type="number" id="modal_target_max_price" placeholder="např. 4500">
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="modal_target_threshold">Práh AI skóre pro upozornění:</label>
+                    <select id="modal_target_threshold">
+                        <option value="">Výchozí (8 / 10)</option>
+                        <option value="7">7 / 10 (Dobré nabídky)</option>
+                        <option value="8">8 / 10 (Skvělé nabídky – doporučeno)</option>
+                        <option value="9">9 / 10 (Výjimečné nabídky)</option>
+                    </select>
+                </div>
+
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="modal_target_active" checked>
+                        <strong>Aktivní (sledovat toto hledání při každém cyklu)</strong>
+                    </label>
+                </div>
+
+                <div style="display: flex; justify-content: flex-end; gap: 10px;">
+                    <button type="button" class="btn btn-secondary" onclick="closeTargetModal()">Zrušit</button>
+                    <button type="submit" class="btn btn-primary" id="btnSaveTargetModal">Uložit hledání</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- TOAST NOTIFICATION -->
     <div id="toast"></div>
 
     <script>
-        let currentStatus = {};
+        let cachedTargets = [];
+        let allDealsCache = [];
 
-        // Inicializace aplikace
         document.addEventListener('DOMContentLoaded', () => {
             loadStatus();
+            loadTargets();
             loadConfig();
             loadTopDeals();
             loadAllDeals();
             loadLogs();
 
-            // Pravidelná aktualizace každých 10 sekund
-            setInterval(() => {
-                loadStatus();
-            }, 10000);
-
-            // Pravidelná aktualizace logů každých 5 sekund
+            setInterval(() => loadStatus(), 10000);
             setInterval(() => {
                 if (document.getElementById('tab-logs').classList.contains('active')) {
                     loadLogs();
@@ -1212,9 +1374,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             toast.textContent = message;
             toast.style.borderColor = isError ? '#ef4444' : '#10b981';
             toast.style.display = 'block';
-            setTimeout(() => {
-                toast.style.display = 'none';
-            }, 4000);
+            setTimeout(() => { toast.style.display = 'none'; }, 4000);
         }
 
         function switchTab(tabId, btn) {
@@ -1222,9 +1382,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
             document.getElementById(tabId).classList.add('active');
             btn.classList.add('active');
-            if (tabId === 'tab-logs') {
-                loadLogs();
-            }
+            if (tabId === 'tab-logs') loadLogs();
         }
 
         function toggleHoursVisibility() {
@@ -1239,7 +1397,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
-                currentStatus = data;
 
                 const badge = document.getElementById('statusBadge');
                 const statusText = document.getElementById('statusText');
@@ -1249,13 +1406,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     statusText.textContent = 'Právě scrapuje a vyhodnocuje...';
                 } else if (!data.is_active_window) {
                     badge.className = 'badge badge-sleeping';
-                    statusText.textContent = 'Mimo aktivní hodiny (šetří tokeny)';
+                    statusText.textContent = 'Mimo aktivní okno (šetří tokeny)';
                 } else {
                     badge.className = 'badge badge-online';
-                    statusText.textContent = 'Online (Plánovač aktivní)';
+                    statusText.textContent = `Online (${data.active_targets_count || 0} aktivních hledání)`;
                 }
 
-                // IP čipy
                 const port = data.web_port || 5050;
                 const tailscaleIp = data.server_ips.tailscale ? `http://${data.server_ips.tailscale}:${port}` : 'Tailscale nenalezeno';
                 const lanIp = `http://${data.server_ips.lan}:${port}`;
@@ -1263,33 +1419,212 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 document.getElementById('tailscaleIpChip').textContent = tailscaleIp;
                 document.getElementById('lanIpChip').textContent = lanIp;
 
-                // Příští kontrola
                 document.getElementById('nextRunInfo').textContent = data.next_run
                     ? `Příští kontrola: ${data.next_run}`
-                    : `Interval kontroly: každých ${data.check_interval_minutes} min`;
-
-                // Shrnutí statistik
-                if (data.stats) {
-                    document.getElementById('statsSummary').textContent = 
-                        `Celkem prověřeno: ${data.stats.total_seen} | AI skórováno: ${data.stats.total_evaluated} | TOP úlovků: ${data.stats.total_deals}`;
-                }
+                    : `Interval: každých ${data.check_interval_minutes} min`;
             } catch (err) {
-                console.error('Chyba při načítání stavu:', err);
+                console.error('Chyba stavu:', err);
             }
         }
 
-        // NAČTENÍ TOP 3 NABÍDEK ZA POSLEDNÍ MĚSÍC
+        // SPRÁVA VYHLEDÁVACÍCH CÍLŮ
+        async function loadTargets() {
+            const container = document.getElementById('targetsContainer');
+            try {
+                const res = await fetch('/api/targets');
+                const data = await res.json();
+                cachedTargets = data.targets || [];
+
+                updateTargetFilterDropdowns();
+
+                if (cachedTargets.length === 0) {
+                    container.innerHTML = `
+                        <div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted); background: var(--bg-card); border-radius: 12px; border: 1px solid var(--border-color);">
+                            Zatím nemáte vytvořené žádné hledání.<br>
+                            Klikněte na <strong>"➕ Přidat nové hledání"</strong> a vytvořte si první kategorii (např. 3D tiskárny, notebooky atd.).
+                        </div>
+                    `;
+                    return;
+                }
+
+                container.innerHTML = cachedTargets.map(t => {
+                    const priceRange = (t.min_price || t.max_price)
+                        ? `${t.min_price ? t.min_price.toLocaleString('cs-CZ') + ' Kč' : '0 Kč'} – ${t.max_price ? t.max_price.toLocaleString('cs-CZ') + ' Kč' : 'bez limitu'}`
+                        : 'Cena bez omezení';
+
+                    const scoreText = t.score_threshold ? `Práh: ${t.score_threshold}/10` : 'Práh: výchozí';
+
+                    return `
+                        <div class="target-card ${t.is_active ? '' : 'paused'}">
+                            <div>
+                                <div class="target-header">
+                                    <span class="target-title">${escapeHtml(t.name)}</span>
+                                    <label class="toggle-switch">
+                                        <input type="checkbox" class="switch-input" ${t.is_active ? 'checked' : ''} onchange="toggleTargetActive('${t.id}')">
+                                        <span class="switch-slider"></span>
+                                        <span style="font-size: 11px; color: ${t.is_active ? '#34d399' : '#9ca3af'};">${t.is_active ? 'Aktivní' : 'Pozastaveno'}</span>
+                                    </label>
+                                </div>
+                                <div class="target-meta">
+                                    <span class="meta-pill">💰 ${priceRange}</span>
+                                    <span class="meta-pill">⭐️ ${scoreText}</span>
+                                </div>
+                                <div class="target-query-box" title="${escapeHtml(t.query)}">
+                                    ${escapeHtml(t.query)}
+                                </div>
+                            </div>
+                            <div class="target-footer">
+                                <span style="font-size: 11px; color: var(--text-muted);">
+                                    ${t.last_scraped_at ? 'Zkontrolováno: ' + t.last_scraped_at.substring(11, 16) : 'Čeká na první cyklus'}
+                                </span>
+                                <div style="display: flex; gap: 6px;">
+                                    <button class="btn btn-secondary btn-sm" onclick="openEditTargetModal('${t.id}')">✏️ Upravit</button>
+                                    <button class="btn btn-danger btn-sm" onclick="deleteTarget('${t.id}')">🗑️</button>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (err) {
+                container.innerHTML = `<div style="grid-column: 1/-1; color: var(--accent-danger);">Chyba při načítání hledání: ${err.message}</div>`;
+            }
+        }
+
+        function updateTargetFilterDropdowns() {
+            const topFilter = document.getElementById('topDealsTargetFilter');
+            const dealsFilter = document.getElementById('dealTargetFilterSelect');
+
+            const options = '<option value="">Všechny kategorie</option>' + cachedTargets.map(t =>
+                `<option value="${t.id}">${escapeHtml(t.name)}</option>`
+            ).join('');
+
+            const prevTopVal = topFilter.value;
+            const prevDealsVal = dealsFilter.value;
+
+            topFilter.innerHTML = options;
+            dealsFilter.innerHTML = options;
+
+            if (prevTopVal) topFilter.value = prevTopVal;
+            if (prevDealsVal) dealsFilter.value = prevDealsVal;
+        }
+
+        async function toggleTargetActive(targetId) {
+            try {
+                const res = await fetch(`/api/targets/${targetId}/toggle`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    showToast(`Hledání bylo ${data.target.is_active ? 'aktivováno' : 'pozastaveno'}.`);
+                    loadTargets();
+                    loadStatus();
+                }
+            } catch (err) {
+                showToast(`Chyba: ${err.message}`, true);
+            }
+        }
+
+        async function deleteTarget(targetId) {
+            if (!confirm('Opravdu chcete smazat toto vyhledávání?')) return;
+            try {
+                const res = await fetch(`/api/targets/${targetId}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (data.success) {
+                    showToast('Hledání bylo smazáno.');
+                    loadTargets();
+                    loadStatus();
+                }
+            } catch (err) {
+                showToast(`Chyba: ${err.message}`, true);
+            }
+        }
+
+        function openAddTargetModal() {
+            document.getElementById('targetModalTitle').textContent = '➕ Nové sledované hledání';
+            document.getElementById('modal_target_id').value = '';
+            document.getElementById('modal_target_name').value = '';
+            document.getElementById('modal_target_query').value = '';
+            document.getElementById('modal_target_min_price').value = '';
+            document.getElementById('modal_target_max_price').value = '';
+            document.getElementById('modal_target_threshold').value = '';
+            document.getElementById('modal_target_active').checked = true;
+            document.getElementById('targetModal').style.display = 'flex';
+        }
+
+        function openEditTargetModal(targetId) {
+            const t = cachedTargets.find(x => x.id === targetId);
+            if (!t) return;
+            document.getElementById('targetModalTitle').textContent = `✏️ Upravit: ${t.name}`;
+            document.getElementById('modal_target_id').value = t.id;
+            document.getElementById('modal_target_name').value = t.name || '';
+            document.getElementById('modal_target_query').value = t.query || '';
+            document.getElementById('modal_target_min_price').value = t.min_price || '';
+            document.getElementById('modal_target_max_price').value = t.max_price || '';
+            document.getElementById('modal_target_threshold').value = t.score_threshold || '';
+            document.getElementById('modal_target_active').checked = !!t.is_active;
+            document.getElementById('targetModal').style.display = 'flex';
+        }
+
+        function closeTargetModal() {
+            document.getElementById('targetModal').style.display = 'none';
+        }
+
+        async function saveTargetForm(e) {
+            e.preventDefault();
+            const targetId = document.getElementById('modal_target_id').value;
+            const payload = {
+                name: document.getElementById('modal_target_name').value,
+                query: document.getElementById('modal_target_query').value,
+                min_price: document.getElementById('modal_target_min_price').value,
+                max_price: document.getElementById('modal_target_max_price').value,
+                score_threshold: document.getElementById('modal_target_threshold').value,
+                is_active: document.getElementById('modal_target_active').checked,
+            };
+
+            const btn = document.getElementById('btnSaveTargetModal');
+            btn.disabled = true;
+            btn.textContent = 'Ukládám...';
+
+            try {
+                const url = targetId ? `/api/targets/${targetId}` : '/api/targets';
+                const method = targetId ? 'PUT' : 'POST';
+
+                const res = await fetch(url, {
+                    method: method,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showToast('✅ Vyhledávací profil byl úspěšně uložen!');
+                    closeTargetModal();
+                    loadTargets();
+                    loadStatus();
+                } else {
+                    showToast(`❌ Chyba: ${data.error}`, true);
+                }
+            } catch (err) {
+                showToast(`❌ Chyba: ${err.message}`, true);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Uložit hledání';
+            }
+        }
+
+        // TOP 3 NABÍDKY
         async function loadTopDeals() {
             const container = document.getElementById('topDealsContainer');
+            const targetId = document.getElementById('topDealsTargetFilter').value;
             try {
-                const res = await fetch('/api/top_deals?limit=3&days=30');
+                let url = '/api/top_deals?limit=3&days=30';
+                if (targetId) url += `&target_id=${encodeURIComponent(targetId)}`;
+
+                const res = await fetch(url);
                 const data = await res.json();
 
                 if (!data.deals || data.deals.length === 0) {
                     container.innerHTML = `
                         <div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted); background: var(--bg-card); border-radius: 12px; border: 1px solid var(--border-color);">
-                            ℹ️ V databázi za poslední měsíc zatím nejsou žádné ohodnocené inzeráty.<br>
-                            Klikněte na <strong>"Spustit vyhledávání ihned"</strong> pro provedení prvního cyklu!
+                            ℹ️ Pro vybranou kategorii zatím nejsou žádné ohodnocené inzeráty.<br>
+                            Spusťte kontrolu tlačítkem <strong>"Spustit vyhledávání ihned"</strong>.
                         </div>
                     `;
                     return;
@@ -1309,6 +1644,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                     const dateStr = deal.seen_at ? deal.seen_at.substring(0, 10) : '';
                     const summaryHtml = deal.summary ? `<div class="card-summary">💡 ${escapeHtml(deal.summary)}</div>` : '';
+                    const targetTagHtml = deal.target_name ? `<div class="target-tag">🏷️ ${escapeHtml(deal.target_name)}</div>` : '';
 
                     return `
                         <div class="deal-card rank-${idx + 1}">
@@ -1317,6 +1653,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                                     <span class="medal-badge ${medal.class}">${medal.label}</span>
                                     <span class="score-pill">⭐️ ${deal.score} / 10</span>
                                 </div>
+                                ${targetTagHtml}
                                 <h3 class="card-title">
                                     <a href="${deal.url}" target="_blank" rel="noopener noreferrer">${escapeHtml(deal.title || 'Inzerát bez názvu')} ↗</a>
                                 </h3>
@@ -1336,19 +1673,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     `;
                 }).join('');
             } catch (err) {
-                container.innerHTML = `<div style="grid-column: 1/-1; color: var(--accent-danger);">Chyba při načítání nabídek: ${err.message}</div>`;
+                container.innerHTML = `<div style="grid-column: 1/-1; color: var(--accent-danger);">Chyba: ${err.message}</div>`;
             }
         }
 
-        // NAČTENÍ KONFIGURACE DO FORMULÁŘE
+        // GLOBÁLNÍ KONFIGURACE PLÁNOVAČE
         async function loadConfig() {
             try {
                 const res = await fetch('/api/config');
                 const cfg = await res.json();
-
-                document.getElementById('user_query').value = cfg.user_query || '';
-                document.getElementById('min_price').value = cfg.min_price || '';
-                document.getElementById('max_price').value = cfg.max_price || '';
                 document.getElementById('check_interval_minutes').value = cfg.check_interval_minutes || 30;
                 document.getElementById('score_threshold').value = cfg.score_threshold || 8;
                 document.getElementById('max_pages_to_scrape').value = cfg.max_pages_to_scrape || 1;
@@ -1356,24 +1689,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 document.getElementById('active_end_hour').value = cfg.active_end_hour !== undefined ? cfg.active_end_hour : 20;
                 document.getElementById('is_24_7').checked = !!cfg.is_24_7;
                 document.getElementById('run_on_startup').checked = !!cfg.run_on_startup;
-
                 toggleHoursVisibility();
             } catch (err) {
-                console.error('Chyba při načítání konfigurace:', err);
+                console.error(err);
             }
         }
 
-        // ULOŽENÍ KONFIGURACE
-        async function saveConfig(e) {
+        async function saveGlobalConfig(e) {
             e.preventDefault();
             const btn = document.getElementById('btnSaveConfig');
             btn.disabled = true;
             btn.textContent = 'Ukládám...';
 
             const payload = {
-                user_query: document.getElementById('user_query').value,
-                min_price: document.getElementById('min_price').value,
-                max_price: document.getElementById('max_price').value,
                 check_interval_minutes: document.getElementById('check_interval_minutes').value,
                 score_threshold: document.getElementById('score_threshold').value,
                 max_pages_to_scrape: document.getElementById('max_pages_to_scrape').value,
@@ -1391,20 +1719,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 });
                 const data = await res.json();
                 if (data.success) {
-                    showToast('✅ Nastavení bylo úspěšně uloženo a aplikováno!');
+                    showToast('✅ Globální nastavení plánovače bylo uloženo!');
                     loadStatus();
                 } else {
-                    showToast(`❌ Chyba: ${data.error || 'Neznámá chyba'}`, true);
+                    showToast(`❌ Chyba: ${data.error}`, true);
                 }
             } catch (err) {
-                showToast(`❌ Chyba sítě: ${err.message}`, true);
+                showToast(`❌ Chyba: ${err.message}`, true);
             } finally {
                 btn.disabled = false;
-                btn.textContent = '💾 Uložit nastavení';
+                btn.textContent = '💾 Uložit globální nastavení';
             }
         }
 
-        // SPUŠTĚNÍ KONTROLY IHNED
+        // AKČNÍ FUNKCE
         async function triggerManualRun() {
             const btn = document.getElementById('btnRunNow');
             btn.disabled = true;
@@ -1414,7 +1742,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const res = await fetch('/api/run_now', { method: 'POST' });
                 const data = await res.json();
                 if (data.status === 'started') {
-                    showToast('🚀 Kontrolní vyhledávací cyklus byl spuštěn na pozadí!');
+                    showToast('🚀 Vyhledávací cyklus přes všechna aktivní hledání spuštěn!');
                     loadStatus();
                 } else {
                     showToast(`ℹ️ ${data.message || 'Nelze spustit'}`);
@@ -1427,14 +1755,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
         }
 
-        // TEST TELEGRAMU
         async function testTelegram() {
-            showToast('📤 Odesílám testovací zprávu na Telegram...');
+            showToast('📤 Testuji spojení s Telegramem...');
             try {
                 const res = await fetch('/api/test_telegram', { method: 'POST' });
                 const data = await res.json();
                 if (data.success) {
-                    showToast('✅ Testovací notifikace dorazila na váš Telegram!');
+                    showToast('✅ Testovací notifikace byla úspěšně doručena!');
                 } else {
                     showToast(`❌ Chyba Telegramu: ${data.error}`, true);
                 }
@@ -1443,46 +1770,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
         }
 
-        // ODESLÁNÍ TOP 3 NA TELEGRAM
         async function sendTopDealsToTelegram() {
-            showToast('📤 Odesílám TOP 3 nabídky na Telegram...');
+            const targetId = document.getElementById('topDealsTargetFilter').value;
+            let url = '/api/send_top_telegram';
+            if (targetId) url += `?target_id=${encodeURIComponent(targetId)}`;
+
+            showToast('📤 Odesílám TOP 3 na Telegram...');
             try {
-                const res = await fetch('/api/send_top_telegram', { method: 'POST' });
+                const res = await fetch(url, { method: 'POST' });
                 const data = await res.json();
                 if (data.success) {
-                    showToast('✅ TOP 3 nabídky byly úspěšně doručeny na Telegram!');
+                    showToast('✅ TOP 3 nabídky byly úspěšně odeslány do Telegramu!');
                 } else {
                     showToast(`❌ Chyba: ${data.error}`, true);
                 }
             } catch (err) {
-                showToast(`❌ Chyba spojení: ${err.message}`, true);
+                showToast(`❌ Chyba: ${err.message}`, true);
             }
         }
 
-        // HISTORIE VŠECH INZERÁTŮ
-        let allDealsCache = [];
-
+        // SEZNAM VŠECH INZERÁTŮ
         async function loadAllDeals() {
             const tbody = document.getElementById('allDealsTableBody');
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Načítám inzeráty...</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">Načítám inzeráty...</td></tr>';
             try {
-                const res = await fetch('/api/all_deals?limit=100');
+                const res = await fetch('/api/all_deals?limit=120');
                 const data = await res.json();
                 allDealsCache = data.deals || [];
                 renderAllDealsTable(allDealsCache);
             } catch (err) {
-                tbody.innerHTML = `<tr><td colspan="7" style="color: var(--accent-danger);">Chyba: ${err.message}</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="8" style="color: var(--accent-danger);">Chyba: ${err.message}</td></tr>`;
             }
         }
 
         function filterAllDeals() {
             const query = document.getElementById('dealSearchInput').value.toLowerCase();
             const minScore = parseInt(document.getElementById('scoreFilterSelect').value, 10);
+            const targetId = document.getElementById('dealTargetFilterSelect').value;
 
             const filtered = allDealsCache.filter(deal => {
                 const matchesQuery = !query || (deal.title && deal.title.toLowerCase().includes(query));
                 const matchesScore = (deal.score || 0) >= minScore;
-                return matchesQuery && matchesScore;
+                const matchesTarget = !targetId || deal.target_id === targetId;
+                return matchesQuery && matchesScore && matchesTarget;
             });
             renderAllDealsTable(filtered);
         }
@@ -1490,7 +1820,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function renderAllDealsTable(deals) {
             const tbody = document.getElementById('allDealsTableBody');
             if (deals.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Nenalezeny žádné inzeráty odpovídající filtru.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">Nenalezeny žádné inzeráty odpovídající filtru.</td></tr>';
                 return;
             }
 
@@ -1504,10 +1834,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     : (deal.price || 'Neuvedeno');
 
                 const dateStr = deal.seen_at ? deal.seen_at.substring(0, 16).replace('T', ' ') : '';
+                const categoryBadge = deal.target_name ? `<span style="color: #a78bfa; font-weight: 600;">${escapeHtml(deal.target_name)}</span>` : '<span style="color: #6b7280;">-</span>';
 
                 return `
                     <tr>
-                        <td style="font-family: monospace; color: var(--text-muted);">${deal.id}</td>
+                        <td style="font-family: monospace; color: var(--text-muted); font-size: 11px;">${deal.id}</td>
+                        <td>${categoryBadge}</td>
                         <td><strong>${escapeHtml(deal.title || 'Bez názvu')}</strong></td>
                         <td style="font-weight: 600; color: #38bdf8;">${priceFormatted}</td>
                         <td>${scoreBadge}</td>
@@ -1521,7 +1853,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }).join('');
         }
 
-        // NAČTENÍ LOGŮ
+        // LOGY
         async function loadLogs() {
             const terminal = document.getElementById('terminalLog');
             try {
@@ -1573,7 +1905,6 @@ def run_web_server(host: str = "0.0.0.0", port: int = 5050):
 
 
 if __name__ == "__main__":
-    # Samostatné spuštění webového serveru
     logging.basicConfig(level=logging.INFO)
     port = config.web_port or 5050
     logger.info(f"Spouštím standalone web server na http://0.0.0.0:{port}")

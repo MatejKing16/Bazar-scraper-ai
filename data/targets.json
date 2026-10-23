@@ -1,0 +1,14 @@
+[
+  {
+    "id": "target_default",
+    "name": "3D tiskárny (Výchozí)",
+    "query": "Levná 3D tiskárna pro účely dalšího prodeje (resell). Hledám velmi podhodnocené nabídky oblíbených modelů. Preferované značky a modely: Creality (Ender 3, Ender 3 V2, Ender 5), Prusa (Mini, MK2, MK3), Anycubic, Elegoo, Bambu Lab (A1 Mini). Stav: plně funkční, zánovní, nebo s drobnou, velmi levně opravitelnou závadou (např. ucpaná tryska, chybějící podložka). Klíčová slova k preferování: 'nevhodný dárek', 'stěhování', 'překáží', 'rychlé jednání sleva', 'nevyužitá'. Vyřaď: nabídky s cenou odpovídající běžné tržní hodnotě, tiskárny po těžké havárii, chybějící základní desky a silně modifikované 'bastly', které se špatně prodávají.",
+    "min_price": 500,
+    "max_price": 4500,
+    "score_threshold": 8,
+    "is_active": true,
+    "created_at": "2026-10-23T19:06:42.867401+00:00",
+    "last_scraped_at": null,
+    "strategy": null
+  }
+]

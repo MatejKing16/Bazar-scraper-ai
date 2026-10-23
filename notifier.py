@@ -78,7 +78,7 @@ class TelegramNotifier:
             logger.error(f"Chyba při odesílání Telegram zprávy: {e}")
             return False
 
-    def send_deal_alert(self, ad: Dict[str, Any], evaluation: Dict[str, Any]) -> bool:
+    def send_deal_alert(self, ad: Dict[str, Any], evaluation: Dict[str, Any], target_name: Optional[str] = None) -> bool:
         """
         Zformátuje a odešle upozornění na vysoce hodnocený inzerát (score >= 8/10).
         Pokud je k dispozici obrázek, odešle jej přes sendPhoto s popiskem.
@@ -94,6 +94,7 @@ class TelegramNotifier:
         date = html.escape(ad.get("date", ""))
         summary = html.escape(evaluation.get("summary", ""))
         fair_price = html.escape(str(evaluation.get("estimated_fair_price", "N/A")))
+        category_header = f"🏷️ <b>Hledání:</b> {html.escape(target_name)}\n" if target_name else ""
 
         # Formátování výhod
         pros = evaluation.get("pros", [])
@@ -108,7 +109,8 @@ class TelegramNotifier:
             cons_text = "\n<b>⚠️ Rizika / Nevýhody:</b>\n" + "\n".join(f"• {html.escape(str(c))}" for c in cons[:3])
 
         caption = (
-            f"🎯 <b>NALEZEN VÝHODNÝ INZERÁT ({score}/10)</b> {stars}\n\n"
+            f"🎯 <b>NALEZEN VÝHODNÝ INZERÁT ({score}/10)</b> {stars}\n"
+            f"{category_header}\n"
             f"📌 <b><a href=\"{url}\">{title}</a></b>\n"
             f"💰 <b>Cena:</b> {price_str} <i>(Odhad férové ceny: {fair_price})</i>\n"
             f"📍 <b>Lokalita:</b> {location}\n"
@@ -151,15 +153,29 @@ class TelegramNotifier:
 
     def send_startup_notification(
         self,
-        search_queries: List[str],
-        excluded_keywords: List[str],
-        user_query: str,
+        search_queries: Optional[List[str]] = None,
+        excluded_keywords: Optional[List[str]] = None,
+        user_query: str = "",
         active_start_hour: Optional[int] = None,
         active_end_hour: Optional[int] = None,
+        targets: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """Odešle uvítací potvrzovací zprávu při startu monitoringu."""
-        queries_str = ", ".join(f"<code>{html.escape(q)}</code>" for q in search_queries[:5])
-        negatives_count = len(excluded_keywords)
+        if targets:
+            active_list = [t for t in targets if t.get("is_active", True)]
+            targets_text = "\n".join(
+                f"• <b>{html.escape(t.get('name', 'Hledání'))}</b> ({t.get('min_price') or 0} - {t.get('max_price') or 'bez limitu'} Kč)"
+                for t in active_list
+            )
+            targets_info = f"🎯 <b>Aktivní sledovaná hledání ({len(active_list)}):</b>\n{targets_text}\n\n"
+        else:
+            queries_str = ", ".join(f"<code>{html.escape(q)}</code>" for q in (search_queries or [])[:5])
+            negatives_count = len(excluded_keywords or [])
+            targets_info = (
+                f"📋 <b>Vaše zadání:</b>\n<i>{html.escape(user_query)}</i>\n\n"
+                f"🔍 <b>Hledané dotazy:</b> {queries_str}\n"
+                f"🛑 <b>Vylučovací slova:</b> {negatives_count} aktivních filtrů\n\n"
+            )
 
         if active_start_hour is not None and active_end_hour is not None:
             schedule_info = f"⏰ <b>Aktivní okno:</b> {active_start_hour:02d}:00 – {active_end_hour:02d}:00 (šetření tokenů)\n"
@@ -168,9 +184,7 @@ class TelegramNotifier:
 
         msg = (
             "🚀 <b>Bazoš Scraper & AI Evaluator spuštěn!</b>\n\n"
-            f"📋 <b>Vaše zadání:</b>\n<i>{html.escape(user_query)}</i>\n\n"
-            f"🔍 <b>Hledané dotazy:</b> {queries_str}\n"
-            f"🛑 <b>Vylučovací slova:</b> {negatives_count} aktivních filtrů\n"
+            f"{targets_info}"
             f"{schedule_info}\n"
             "Při nalezení inzerátu s hodnocením <b>8/10 a vyšším</b> obdržíte okamžité upozornění."
         )

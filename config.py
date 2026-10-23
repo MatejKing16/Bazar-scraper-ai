@@ -79,6 +79,7 @@ class Config:
             self.data_dir = data_path
 
         self.seen_ids_file = self.data_dir / "seen_ids.json"
+        self.targets_file = self.data_dir / "targets.json"
 
         # Vytvoření adresáře pokud neexistuje
         self.data_dir.mkdir(parents=True, exist_ok=True)

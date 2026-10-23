@@ -26,9 +26,8 @@ def test_web_index(test_client):
     html = res.get_data(as_text=True)
     assert "Bazoš Scraper & AI Evaluator" in html
     assert "TOP 3 nejlepší nabídky za poslední měsíc" in html
-    assert "Co scrapovat?" in html
-    assert "Kolik scrapovat?" in html
-    assert "Kdy scrapovat?" in html
+    assert "Sledovaná hledání" in html
+    assert "Nastavení plánovače kontrol" in html
 
 
 def test_web_status_endpoint(test_client):
