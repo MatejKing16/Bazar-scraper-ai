@@ -8,7 +8,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
 # Načtení souboru .env z kořenového adresáře projektu
@@ -54,9 +54,19 @@ class Config:
     # 6. Režim simulace / Mock (užitečné pro rychlý test bez Groq klíče)
     mock_mode: bool = os.getenv("MOCK_MODE", "false").lower() in ("true", "1", "yes")
 
-    # 7. Cesty a perzistence
+    # 7. Časové okno aktivity (šetření Groq API tokenů)
+    active_start_hour: Optional[int] = _parse_optional_int("ACTIVE_START_HOUR")
+    active_end_hour: Optional[int] = _parse_optional_int("ACTIVE_END_HOUR")
+    run_on_startup: bool = os.getenv("RUN_ON_STARTUP", "false").lower() in ("true", "1", "yes")
+
+    # 8. Cesty a perzistence
     bazos_base_url: str = os.getenv("BAZOS_BASE_URL", "https://www.bazos.cz").rstrip("/")
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
+
+    # 9. Lokální Webové rozhraní (Dashboard)
+    web_enabled: bool = os.getenv("WEB_ENABLED", "true").lower() in ("true", "1", "yes")
+    web_host: str = os.getenv("WEB_HOST", "0.0.0.0").strip()
+    web_port: int = _parse_optional_int("WEB_PORT") or 5050
 
     def __post_init__(self):
         # Nastavení adresáře dat - relativní k projektu nebo absolutní (např. /app/data v Dockeru)
@@ -116,6 +126,84 @@ class Config:
             for err in errors:
                 logging.error(f"[CONFIG CHYBA] {err}")
             raise ValueError("\n".join(errors))
+
+    def reload(self) -> None:
+        """Znovu načte proměnné prostředí ze souboru .env a obnoví atributy konfigurace."""
+        env_path = Path(__file__).resolve().parent / ".env"
+        load_dotenv(dotenv_path=env_path, override=True)
+        self.groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+        self.groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+        self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        self.user_query = os.getenv("USER_QUERY", self.user_query).strip()
+        self.min_price = _parse_optional_int("MIN_PRICE")
+        self.max_price = _parse_optional_int("MAX_PRICE")
+        self.check_interval_minutes = _parse_optional_int("CHECK_INTERVAL_MINUTES") or 30
+        self.score_threshold = _parse_optional_int("SCORE_THRESHOLD") or 8
+        self.max_pages_to_scrape = _parse_optional_int("MAX_PAGES_TO_SCRAPE") or 1
+        self.mock_mode = os.getenv("MOCK_MODE", "false").lower() in ("true", "1", "yes")
+        self.active_start_hour = _parse_optional_int("ACTIVE_START_HOUR")
+        self.active_end_hour = _parse_optional_int("ACTIVE_END_HOUR")
+        self.run_on_startup = os.getenv("RUN_ON_STARTUP", "false").lower() in ("true", "1", "yes")
+        self.web_enabled = os.getenv("WEB_ENABLED", "true").lower() in ("true", "1", "yes")
+        self.web_host = os.getenv("WEB_HOST", "0.0.0.0").strip()
+        self.web_port = _parse_optional_int("WEB_PORT") or 5050
+
+
+def update_env_file(updates: Dict[str, Any], env_file_path: Optional[Path] = None) -> None:
+    """
+    Aktualizuje vybrané klíče v souboru .env se zachováním stávajících komentářů a struktury.
+    Po aktualizaci automaticky přenačte globální konfiguraci.
+    """
+    env_path = env_file_path or (Path(__file__).resolve().parent / ".env")
+    if not env_path.exists():
+        lines = []
+    else:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    updated_keys = set()
+    new_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped or "=" not in stripped:
+            new_lines.append(line)
+            continue
+
+        key = stripped.split("=", 1)[0].strip()
+        if key in updates:
+            val = updates[key]
+            updated_keys.add(key)
+            if val is None or val == "":
+                new_lines.append(f"{key}=")
+            elif isinstance(val, bool):
+                new_lines.append(f"{key}={'true' if val else 'false'}")
+            elif isinstance(val, (int, float)):
+                new_lines.append(f"{key}={val}")
+            else:
+                str_val = str(val).strip()
+                # Zabalit do uvozovek pokud obsahuje mezery nebo speciální znaky
+                safe_val = str_val.replace('"', '\\"')
+                new_lines.append(f'{key}="{safe_val}"')
+        else:
+            new_lines.append(line)
+
+    # Přidat klíče, které v souboru ještě nebyly
+    for key, val in updates.items():
+        if key not in updated_keys:
+            if val is None or val == "":
+                new_lines.append(f"{key}=")
+            elif isinstance(val, bool):
+                new_lines.append(f"{key}={'true' if val else 'false'}")
+            elif isinstance(val, (int, float)):
+                new_lines.append(f"{key}={val}")
+            else:
+                str_val = str(val).strip()
+                safe_val = str_val.replace('"', '\\"')
+                new_lines.append(f'{key}="{safe_val}"')
+
+    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    config.reload()
 
 
 # Globální instance konfigurace

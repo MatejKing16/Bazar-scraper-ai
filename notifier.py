@@ -154,17 +154,64 @@ class TelegramNotifier:
         search_queries: List[str],
         excluded_keywords: List[str],
         user_query: str,
+        active_start_hour: Optional[int] = None,
+        active_end_hour: Optional[int] = None,
     ) -> bool:
         """Odešle uvítací potvrzovací zprávu při startu monitoringu."""
         queries_str = ", ".join(f"<code>{html.escape(q)}</code>" for q in search_queries[:5])
         negatives_count = len(excluded_keywords)
+
+        if active_start_hour is not None and active_end_hour is not None:
+            schedule_info = f"⏰ <b>Aktivní okno:</b> {active_start_hour:02d}:00 – {active_end_hour:02d}:00 (šetření tokenů)\n"
+        else:
+            schedule_info = "⏰ <b>Režim:</b> Běží 24/7 s automatickým plánovačem.\n"
 
         msg = (
             "🚀 <b>Bazoš Scraper & AI Evaluator spuštěn!</b>\n\n"
             f"📋 <b>Vaše zadání:</b>\n<i>{html.escape(user_query)}</i>\n\n"
             f"🔍 <b>Hledané dotazy:</b> {queries_str}\n"
             f"🛑 <b>Vylučovací slova:</b> {negatives_count} aktivních filtrů\n"
-            "⏰ <b>Režim:</b> Běží 24/7 s automatickým plánovačem.\n\n"
+            f"{schedule_info}\n"
             "Při nalezení inzerátu s hodnocením <b>8/10 a vyšším</b> obdržíte okamžité upozornění."
         )
         return self.send_message(msg)
+
+    def send_test_message(self) -> bool:
+        """Odešle testovací zprávu na Telegram pro ověření funkčnosti."""
+        msg = (
+            "🔔 <b>Bazoš Scraper & AI Evaluator</b>\n\n"
+            "Testovací notifikace z webového rozhraní proběhla úspěšně! Spojení s Telegram botem funguje bezchybně."
+        )
+        return self.send_message(msg)
+
+    def send_top_deals(self, top_deals: List[Dict[str, Any]]) -> bool:
+        """Odešle souhrnný report TOP 3 nejlepších nabídek za poslední měsíc."""
+        if not top_deals:
+            return self.send_message("ℹ️ V databázi nebyly nalezeny žádné TOP nabídky za poslední měsíc.")
+
+        medals = ["🥇", "🥈", "🥉"]
+        items_parts = []
+        for i, deal in enumerate(top_deals[:3]):
+            medal = medals[i] if i < len(medals) else f"#{i+1}"
+            title = html.escape(str(deal.get("title", "Bez názvu")))
+            price = deal.get("price")
+            price_str = f"{price:,} Kč".replace(",", " ") if isinstance(price, int) else html.escape(str(deal.get("price_str") or "Neuvedena"))
+            score = deal.get("score", 0)
+            stars = "⭐️" * max(1, min(5, (score // 2) + (1 if score % 2 else 0)))
+            url = deal.get("url") or f"https://www.bazos.cz/inzerat/{deal.get('id')}/"
+            seen_at_str = str(deal.get("seen_at", ""))[:10]
+            summary = html.escape(str(deal.get("summary", "")))
+            summary_part = f"\n   💡 <i>{summary}</i>" if summary else ""
+
+            items_parts.append(
+                f"{medal} <b><a href=\"{url}\">{title}</a></b>\n"
+                f"   💰 Cena: <b>{price_str}</b> | Skóre: <b>{score}/10</b> {stars} ({seen_at_str})"
+                f"{summary_part}"
+            )
+
+        text = (
+            "🏆 <b>TOP 3 NEJLEPŠÍ NABÍDKY ZA POSLEDNÍ MĚSÍC</b>\n\n"
+            + "\n\n".join(items_parts)
+            + "\n\n🤖 <i>Vygenerováno z lokálního webového rozhraní Bazoš Scraper AI</i>"
+        )
+        return self.send_message(text)

@@ -20,8 +20,13 @@ Plně automatizovaná, kontejnerizovaná pipeline v Pythonu pro nepřetržité s
    - Atomický zápis na disk chrání před poškozením databáze.
 5. **Okamžité Telegram notifikace:**
    - Inzeráty se skóre 8/10+ jsou okamžitě doručeny na váš telefon včetně fotky, výhod, rizik a přímého odkazu.
-6. **Běh 24/7 v Docker kontejneru:**
+6. **Běh 24/7 (PM2 / Docker / systémová služba):**
    - Automatický plánovač (`schedule`) spouští kontrolu ve zvoleném intervalu (např. každých 30 minut).
+7. **Lokální webový dashboard (Tailscale / LAN):**
+   - Responzivní webový ovládací panel na portu 5050.
+   - Možnost naklikat **Co** (zadání, min/max cena), **Kolik** (počet stránek, práh skóre) a **Kdy** (interval, 24/7 vs denní hodiny).
+   - Zobrazení **🏆 TOP 3 nabídek za poslední měsíc** s možností odeslání do Telegramu na jedno kliknutí.
+   - Živá systémová konzole s výpisem událostí a tlačítko pro okamžité spuštění kontroly.
 
 ---
 
@@ -31,7 +36,8 @@ Plně automatizovaná, kontejnerizovaná pipeline v Pythonu pro nepřetržité s
 Bazar-scraper-ai/
 ├── Dockerfile              # Lehký Python 3.11-slim Docker image
 ├── docker-compose.yml      # Správa kontejneru s perzistentním volume pro data
-├── requirements.txt        # Závislosti projektu (groq, requests, bs4, schedule, ...)
+├── ecosystem.config.js     # PM2 konfigurace pro automatický start a restart
+├── requirements.txt        # Závislosti projektu (groq, requests, bs4, schedule, flask, ...)
 ├── .dockerignore           # Vyloučení zbytečných souborů z Docker buildu
 ├── .env                    # Vaše aktivní konfigurace (API klíče, zadání, filtry)
 ├── .env.example            # Vzorový konfigurační soubor s nápovědou
@@ -39,6 +45,7 @@ Bazar-scraper-ai/
 ├── scraper.py              # Bazoš scraper s ošetřením kódování a hrubým filtrem
 ├── groq_client.py          # Groq API klient s retry logikou a fallbackem
 ├── notifier.py             # Telegram notifikátor s HTML formátováním a obrázky
+├── web.py                  # Lokální Flask webový dashboard a REST API
 ├── main.py                 # Hlavní pipeline orchestrátor s 24/7 plánovačem
 ├── tests/
 │   └── test_pipeline.py    # Sada jednotkových testů (pytest)
@@ -119,10 +126,29 @@ python main.py
 
 ---
 
+## 🌐 Lokální Webový Dashboard (Tailscale / LAN)
+
+Aplikace má integrovaný webový dashboard běžící na portu `5050`:
+
+- **Přístup přes Tailscale:** `http://<Vase-Tailscale-IP>:5050` (např. `http://100.107.207.42:5050`)
+- **Přístup v lokální síti:** `http://<IP-serveru>:5050` (např. `http://192.168.0.104:5050`)
+- **Přímo na serveru:** `http://localhost:5050`
+
+### Co dashboard umožňuje:
+- **🏆 TOP 3 nabídky za poslední měsíc:** Zlatá, stříbrná a bronzová medaile pro nejvýhodnější úlovky podle AI hodnocení, s možností poslat je do Telegramu na jedno kliknutí.
+- **🎯 Co scrapovat:** Úprava přirozeného AI promptu a cenového rozptylu (Min/Max Kč).
+- **📄 Kolik scrapovat:** Počet procházených stránek a práh skóre pro okamžité notifikace (např. 8/10).
+- **⏰ Kdy scrapovat:** Nastavení periody v minutách a volba mezi nepřetržitým režimem 24/7 nebo časovým oknem (např. 08:00–20:00 pro úsporu API tokenů).
+- **🚀 Okamžitá kontrola:** Tlačítko pro spuštění vyhledávacího cyklu ihned bez čekání na plánovač.
+- **🔔 Test Telegramu:** Ověření spojení s Telegram botem.
+- **📟 Živý terminál:** Zobrazení posledních systémových logů přímo v prohlížeči.
+
+---
+
 ## 🧪 Spuštění testů
 
-Projekt obsahuje sadu automatických testů:
+Projekt obsahuje kompletní sadu automatických testů:
 
 ```bash
-pytest tests/test_pipeline.py -v
+pytest tests/ -v
 ```

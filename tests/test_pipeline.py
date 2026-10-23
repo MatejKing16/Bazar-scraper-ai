@@ -141,3 +141,35 @@ def test_notifier_simulation():
     }
     success = notifier.send_deal_alert(ad, eval_res)
     assert success is True
+
+
+def test_active_hours_logic(monkeypatch):
+    from main import BazosHunterPipeline
+    import datetime
+
+    pipeline = BazosHunterPipeline()
+
+    # Case 1: Unrestricted hours (None)
+    monkeypatch.setattr("config.config.active_start_hour", None)
+    monkeypatch.setattr("config.config.active_end_hour", None)
+    assert pipeline.is_within_active_hours() is True
+
+    # Case 2: Restricted hours (8 to 10)
+    monkeypatch.setattr("config.config.active_start_hour", 8)
+    monkeypatch.setattr("config.config.active_end_hour", 10)
+
+    class MockDateTime8:
+        @classmethod
+        def now(cls):
+            return datetime.datetime(2026, 10, 16, 8, 30)
+
+    class MockDateTime12:
+        @classmethod
+        def now(cls):
+            return datetime.datetime(2026, 10, 16, 12, 30)
+
+    monkeypatch.setattr("main.datetime", MockDateTime8)
+    assert pipeline.is_within_active_hours() is True
+
+    monkeypatch.setattr("main.datetime", MockDateTime12)
+    assert pipeline.is_within_active_hours() is False
