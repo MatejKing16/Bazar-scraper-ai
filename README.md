@@ -20,12 +20,18 @@ Plně automatizovaná, kontejnerizovaná pipeline v Pythonu pro nepřetržité s
    - Atomický zápis na disk chrání před poškozením databáze.
 5. **Okamžité Telegram notifikace:**
    - Inzeráty se skóre 8/10+ jsou okamžitě doručeny na váš telefon včetně fotky, výhod, rizik a přímého odkazu.
-6. **Běh 24/7 (PM2 / Docker / systémová služba):**
-   - Automatický plánovač (`schedule`) spouští kontrolu ve zvoleném intervalu (např. každých 30 minut).
-7. **Lokální webový dashboard (Tailscale / LAN):**
+6. **Sledování více aktivních hledání naráz (Multi-Search):**
+   - Možnost definovat libovolné množství paralelně sledovaných cílů (např. 3D tiskárny, herní notebooky, grafické karty).
+   - Každý cíl má vlastní AI prompt, cenový rozptyl, práh skóre i přepínač aktivní/pozastaveno.
+   - Všechny inzeráty v databázi i Telegram alerty jsou automaticky označeny svou kategorií.
+7. **Běh 24/7 (Docker / PM2 s automatickým restartem a legit-checkem):**
+   - **Docker:** `Dockerfile` s integrovaným `HEALTHCHECK` a `docker-compose.yml` s `restart: unless-stopped` a portem `5050:5050`.
+   - **PM2:** `ecosystem.config.js` s `autorestart: true` a exponenciálním backoffem.
+8. **Lokální webový dashboard (Tailscale / LAN):**
    - Responzivní webový ovládací panel na portu 5050.
-   - Možnost naklikat **Co** (zadání, min/max cena), **Kolik** (počet stránek, práh skóre) a **Kdy** (interval, 24/7 vs denní hodiny).
-   - Zobrazení **🏆 TOP 3 nabídek za poslední měsíc** s možností odeslání do Telegramu na jedno kliknutí.
+   - Správa sledovaných hledání (přidat, upravit, pozastavit, smazat).
+   - Zobrazení **🏆 TOP 3 nabídek za poslední měsíc** s filtrováním dle kategorií a odesláním do Telegramu na jedno kliknutí.
+   - Globální nastavení plánovače (interval, 24/7 vs denní hodiny, limit stránek).
    - Živá systémová konzole s výpisem událostí a tlačítko pro okamžité spuštění kontroly.
 
 ---

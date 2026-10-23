@@ -9,6 +9,34 @@
     "is_active": true,
     "created_at": "2026-10-23T19:06:42.867401+00:00",
     "last_scraped_at": null,
-    "strategy": null
+    "strategy": {
+      "search_queries": [
+        "ender 3",
+        "prusa mini",
+        "bambu lab a1 mini"
+      ],
+      "excluded_keywords": [
+        "poptávám",
+        "prasklý",
+        "blokovaný",
+        "bastl",
+        "sháním",
+        "na díly",
+        "poškozený",
+        "chybí",
+        "chybějící základní deska",
+        "koupím",
+        "vada",
+        "silně modifikovaná",
+        "nefunkční",
+        "vadný",
+        "na součástky",
+        "havárie",
+        "vyměním"
+      ],
+      "min_price": 500,
+      "max_price": 4500,
+      "explanation": "Strategie se zaměřuje na vyhledávání konkrétních, oblíbených modelů (Creality, Prusa, Bambu Lab), které mají vysokou poptávku na trhu s ojetým zbožím. Protože uživatel hledá 'velmi podhodnocené' nabídky a neuvádí pevný rozpočet, cenové filtry nejsou nastaveny, aby se neztratily extrémně levné kousky. Vylučovací slova cílí na nefunkční stroje, díly a silné modifikace, které by snížily hodnotu při dalším prodeji. Klíčová slova pro preferenci (jako 'stěhování' nebo 'nevhodný dárek') nelze přímo zadat do vyhledávače Bazoše jako filtr, ale slouží jako vodítko pro rychlou identifikaci potenciálně levných nabídek v výsledcích."
+    }
   }
 ]
